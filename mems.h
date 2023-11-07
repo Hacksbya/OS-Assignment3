@@ -36,34 +36,37 @@ Returns: Nothing
 // Define the PROCESS and HOLE types
 typedef enum { PROCESS, HOLE } segment_type_t;
 
-// Define the segment structure
 typedef struct segment {
-  void *start_addr;
-  size_t size;
-  segment_type_t type;
   uintptr_t physical_addr; // Physical address of the segment
+  uintptr_t mems_virtual_addr; // MeMS virtual address of the segment
+  uintptr_t start_addr; // Starting MeMS virtual address of the segment (for process segments)
+  size_t size; // Size of the segment in bytes
+  int type; // Type of the segment (PROCESS or HOLE)
 } segment_t;
 
-// Define the free_list_node structure
+
 typedef struct free_list_node {
-  segment_t segment;
-  struct free_list_node *next;
+  segment_t segment; // Segment information
+  struct free_list_node *next; // Pointer to the next node in the free list
+  struct free_list_node *sub_chain_head; // Pointer to the head of the sub-chain (if applicable)
 } free_list_node;
+
+
 
 // Declare the global variables
 free_list_node *free_list_head = NULL;
-const uintptr_t STARTING_MEMS_VIRTUAL_ADDR = 0x10000000; // Starting MeMS virtual address
-uintptr_t mems_virtual_addr = STARTING_MEMS_VIRTUAL_ADDR; // Current MeMS virtual address
+// const uintptr_t STARTING_MEMS_VIRTUAL_ADDR = 4000; // Starting MeMS virtual address
+uintptr_t mems_virtual_addr = 4000; // Current MeMS virtual address
 
 
-void mems_init(){
-    // Initialize the head of the free list to NULL
-    free_list_head = NULL;
+void mems_init() {
+  // Initialize the free list head to NULL
+  free_list_head = NULL;
 
-    // Set the starting MeMS virtual address
-    mems_virtual_addr = STARTING_MEMS_VIRTUAL_ADDR;
-
+  // Set the starting MeMS virtual address to 4000
+  mems_virtual_addr = 4000;
 }
+
 
 
 /*
@@ -72,15 +75,15 @@ allocated memory using the munmap system call.
 Input Parameter: Nothing
 Returns: Nothing
 */
-void mems_finish(){
-    // Traverse the free list and unmap each segment
-    free_list_node *curr_node = free_list_head;
-    while (curr_node != NULL) {
-        munmap((void *) curr_node->segment.start_addr, curr_node->segment.size);
-        curr_node = curr_node->next;
-    }
-    
+void mems_finish() {
+  // Traverse the free list and munmap each segment
+  free_list_node *curr_node = free_list_head;
+  while (curr_node != NULL) {
+    munmap((void *) curr_node->segment.physical_addr, curr_node->segment.size);
+    curr_node = curr_node->next;
+  }
 }
+
 
 
 /*
@@ -95,65 +98,70 @@ by adding it to the free list.
 Parameter: The size of the memory the user program wants
 Returns: MeMS Virtual address (that is created by MeMS)
 */ 
+
+
+// Allocate memory of the specified size
 void* mems_malloc(size_t size) {
-    // Check if there's a sufficiently large segment in the free list
-    free_list_node *curr_node = free_list_head;
-    free_list_node *prev_node = NULL;
-    while (curr_node != NULL) {
-        if (curr_node->segment.size >= size) {
-            // Split the segment if necessary
-            if (curr_node->segment.size > size + sizeof(free_list_node)) {
-                // Create a new segment for the remaining unused space
-                free_list_node *new_node = malloc(sizeof(free_list_node));
-                new_node->segment.start_addr = curr_node->segment.start_addr + size + sizeof(free_list_node);
-                new_node->segment.size = curr_node->segment.size - size - sizeof(free_list_node);
-                new_node->next = curr_node->next;
+  // Round up the size to the nearest multiple of PAGE_SIZE
+  size = (size + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
 
-                // Update the current segment's size
-                curr_node->segment.size = size;
+  // Search for a sufficiently large HOLE segment in the free list
+  free_list_node *curr_node = free_list_head;
+  while (curr_node != NULL) {
+    free_list_node *hole_node = curr_node->sub_chain_head;
+    while (hole_node != NULL) {
+      if (hole_node->segment.type == HOLE && hole_node->segment.size >= size) {
+        // Found a suitable HOLE segment, allocate memory from it
+        if (hole_node->segment.size == size) {
+          // No remaining space, mark the entire segment as PROCESS
+          hole_node->segment.type = PROCESS;
+          return (void *) (hole_node->segment.mems_virtual_addr);
+        } else {
+          // Split the HOLE segment into PROCESS and HOLE segments
+          free_list_node *new_hole_node = (free_list_node *) malloc(sizeof(free_list_node));
+          new_hole_node->segment.mems_virtual_addr = hole_node->segment.mems_virtual_addr + size;
+          new_hole_node->segment.physical_addr = hole_node->segment.physical_addr + size;
+          new_hole_node->segment.size = hole_node->segment.size - size;
+          new_hole_node->segment.type = HOLE;
+          new_hole_node->next = hole_node->next;
+          hole_node->next = new_hole_node;
 
-                // Insert the new segment into the free list
-                if (curr_node == free_list_head) {
-                    free_list_head = new_node;
-                } else {
-                    prev_node->next = new_node;
-                }
-            }
-
-            // Allocate the memory and remove the segment from the free list
-            void *mems_virtual_addr = curr_node->segment.start_addr;
-            if (curr_node == free_list_head) {
-                free_list_head = curr_node->next;
-            } else {
-                prev_node->next = curr_node->next;
-            }
-            free(curr_node);
-
-            return mems_virtual_addr;
+          hole_node->segment.size = size;
+          hole_node->segment.type = PROCESS;
+          return (void *) (hole_node->segment.mems_virtual_addr);
         }
+      }
 
-        prev_node = curr_node;
-        curr_node = curr_node->next;
+      hole_node = hole_node->next;
     }
 
-    // No suitable segment found in the free list, use mmap to allocate new memory
-    void *mems_virtual_addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (mems_virtual_addr == MAP_FAILED) {
-        return NULL;
-    }
+    curr_node = curr_node->next;
+  }
 
-    // Add the unused space from mmap to the free list
-    size_t unused_space = PAGE_SIZE - (size % PAGE_SIZE);
-    if (unused_space > 0) {
-        free_list_node *new_node = malloc(sizeof(free_list_node));
-        new_node->segment.start_addr = mems_virtual_addr + size;
-        new_node->segment.size = unused_space;
-        new_node->next = free_list_head;
-        free_list_head = new_node;
-    }
+  // No suitable HOLE segment found, mmap new memory
+  segment_t new_segment;
+  new_segment.mems_virtual_addr = mems_virtual_addr;
+  new_segment.physical_addr = (uintptr_t) mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (new_segment.physical_addr == (uintptr_t)MAP_FAILED) {
+  return NULL; // Handle error
+  }
 
-    return mems_virtual_addr;
+  new_segment.size = size;
+  new_segment.type = PROCESS;
+
+  // Add the new segment to the free list
+  free_list_node *new_node = (free_list_node *) malloc(sizeof(free_list_node));
+  new_node->segment = new_segment;
+  new_node->next = free_list_head;
+  free_list_head = new_node;
+
+  // Update the starting MeMS virtual address for future allocations
+  mems_virtual_addr += size;
+
+  return (void *) (new_segment.mems_virtual_addr);
 }
+
+
 
 
 
@@ -165,41 +173,64 @@ this function print the stats of the MeMS system like
 Parameter: Nothing
 Returns: Nothing but should print the necessary information on STDOUT
 */
+
+
+// Print statistics about the MeMS system
 void mems_print_stats() {
-    // Calculate total utilized memory and unused memory
-    size_t total_utilized_memory = 0;
-    size_t total_unused_memory = 0;
+  // Initialize counters
+  int total_mapped_pages = 0;
+  size_t total_unused_memory = 0;
 
-    free_list_node *curr_node = free_list_head;
-    while (curr_node != NULL) {
-        if (curr_node->segment.type == PROCESS) {
-            total_utilized_memory += curr_node->segment.size;
-        } else {
-            total_unused_memory += curr_node->segment.size;
-        }
-        curr_node = curr_node->next;
+  // Traverse the free list and accumulate statistics
+  free_list_node *curr_node = free_list_head;
+  while (curr_node != NULL) {
+    total_mapped_pages += curr_node->segment.size / PAGE_SIZE;
+
+    free_list_node *hole_node = curr_node->sub_chain_head;
+    while (hole_node != NULL) {
+      if (hole_node->segment.type == HOLE) {
+        total_unused_memory += hole_node->segment.size;
+      }
+
+      hole_node = hole_node->next;
     }
 
-    // Print statistics header
-    printf("\nMeMS System Statistics:\n");
+    curr_node = curr_node->next;
+  }
 
-    // Print total utilized memory
-    printf("Total Utilized Memory: %lu bytes\n", total_utilized_memory);
+  // Print statistics
+  printf("Total mapped pages: %d\n", total_mapped_pages);
+  printf("Total unused memory: %zu bytes\n", total_unused_memory);
 
-    // Print total unused memory
-    printf("Total Unused Memory: %lu bytes\n", total_unused_memory);
+  // Print details about each node in the free list
+  curr_node = free_list_head;
+  while (curr_node != NULL) {
+    printf("Node: %p\n", curr_node);
+    printf("  Physical address: %p\n", (void *) curr_node->segment.physical_addr);
+    printf("  MeMS virtual address: %p\n", (void *) curr_node->segment.mems_virtual_addr);
+    printf("  Segment size: %zu bytes\n", curr_node->segment.size);
+    printf("  Segment type: %s\n", curr_node->segment.type == PROCESS ? "PROCESS" : "HOLE");
 
-    // Print free list details
-    printf("\nFree List Details:\n");
-    curr_node = free_list_head;
-    while (curr_node != NULL) {
-        printf("Segment Address: %p\n", curr_node->segment.start_addr);
-        printf("Segment Size: %lu bytes\n", curr_node->segment.size);
-        printf("Segment Type: %s\n", (curr_node->segment.type == PROCESS) ? "PROCESS" : "HOLE");
-        printf("\n");
-        curr_node = curr_node->next;
+    if (curr_node->sub_chain_head != NULL) {
+      printf("  Sub-chain:\n");
+      free_list_node *hole_node = curr_node->sub_chain_head;
+      while (hole_node != NULL) {
+        printf("    Hole: %p\n", hole_node);
+        printf("      Physical address: %p\n", (void *) hole_node->segment.physical_addr);
+        printf("      MeMS virtual address: %p\n", (void *) hole_node->segment.mems_virtual_addr);
+        printf("      Hole size: %zu bytes\n", hole_node->segment.size);
+        printf("      Hole type: %s\n", hole_node->segment.type == PROCESS ? "PROCESS" : "HOLE");
+
+        hole_node = hole_node->next;
+      }
     }
+
+    printf("---------------------------------\n");
+    curr_node = curr_node->next;
+  }
 }
+
+
 
 
 
@@ -209,21 +240,23 @@ Parameter: MeMS Virtual address (that is created by MeMS)
 Returns: MeMS physical address mapped to the passed ptr (MeMS virtual address).
 */
 void* mems_get(void *v_ptr) {
+    // Check if the virtual address is NULL
+    if (v_ptr == NULL) {
+        return NULL;
+    }
+
     // Check if the virtual address is within the MeMS virtual address space
-    if ((uintptr_t) v_ptr < mems_virtual_addr) {
+    if ((uintptr_t) v_ptr < 4000) {
         return NULL;
     }
 
     // Traverse the free list to find the corresponding segment
     free_list_node *curr_node = free_list_head;
     while (curr_node != NULL) {
-        if (v_ptr >= curr_node->segment.start_addr &&
-            v_ptr < curr_node->segment.start_addr + curr_node->segment.size) {
-            // Calculate the physical address offset from the segment's start address
-            uintptr_t offset = (uintptr_t) v_ptr - (uintptr_t) curr_node->segment.start_addr;
-
-            // Return the physical address by adding the offset to the segment's physical address
-            return (void *) (curr_node->segment.physical_addr + offset);
+        if ((uintptr_t)v_ptr >= (uintptr_t)curr_node->segment.start_addr &&
+        (uintptr_t)v_ptr < (uintptr_t)(curr_node->segment.start_addr + curr_node->segment.size)) {
+          uintptr_t offset = (uintptr_t)v_ptr - (uintptr_t)curr_node->segment.start_addr;
+          return (void *)(curr_node->segment.physical_addr + offset);
         }
         curr_node = curr_node->next;
     }
@@ -234,61 +267,47 @@ void* mems_get(void *v_ptr) {
 
 
 
+
 /*
 this function free up the memory pointed by our virtual_address and add it to the free list
 Parameter: MeMS Virtual address (that is created by MeMS) 
 Returns: nothing
 */
-void mems_free(void *v_ptr) {
-  // Check if the virtual address is within the MeMS virtual address space
-  if ((uintptr_t)v_ptr < mems_virtual_addr) {
+void mems_free(void* ptr) {
+  // Validate the MeMS virtual address
+  if (ptr == NULL) {
     return;
   }
 
-  // Traverse the free list to find the segment before the virtual address
-  free_list_node *prev_node = NULL;
+  // Traverse the free list to find the corresponding segment
   free_list_node *curr_node = free_list_head;
   while (curr_node != NULL) {
-    if (v_ptr < curr_node->segment.start_addr) {
-      break;
+    free_list_node *hole_node = curr_node->sub_chain_head;
+    while (hole_node != NULL) {
+      if (hole_node->segment.type == PROCESS && hole_node->segment.mems_virtual_addr == (uintptr_t) ptr) {
+        // Found the corresponding PROCESS segment, mark it as HOLE
+        hole_node->segment.type = HOLE;
+
+        // Coalesce adjacent HOLE segments
+        free_list_node *prev_node = curr_node;
+        while (prev_node != NULL && prev_node->sub_chain_head->segment.type == HOLE) {
+          // Merge the current HOLE segment with the previous HOLE segment
+          prev_node->sub_chain_head->segment.size += hole_node->segment.size;
+          prev_node->sub_chain_head->next = hole_node->next;
+          free(hole_node);
+          hole_node = prev_node->sub_chain_head;
+        }
+
+        return;
+      }
+
+      hole_node = hole_node->next;
     }
-    prev_node = curr_node;
+
     curr_node = curr_node->next;
   }
 
-  // Check if the virtual address is within the current segment
-  if (curr_node != NULL && v_ptr >= curr_node->segment.start_addr &&
-      v_ptr < curr_node->segment.start_addr + curr_node->segment.size) {
-    // Merge with the previous segment if possible
-    if (prev_node != NULL && prev_node->segment.type == HOLE) {
-      prev_node->segment.size += curr_node->segment.size;
-      prev_node->next = curr_node->next;
-      free(curr_node);
-      curr_node = prev_node;
-    }
-
-    // Merge with the next segment if possible
-    if (curr_node->next != NULL && curr_node->next->segment.type == HOLE) {
-      curr_node->segment.size += curr_node->next->segment.size;
-      free(curr_node->next);
-    }
-
-    // Convert the current segment to a HOLE
-    curr_node->segment.type = HOLE;
-  } else {
-    // Create a new HOLE segment for the freed memory
-    free_list_node *new_node = malloc(sizeof(free_list_node));
-    new_node->segment.start_addr = v_ptr;
-    new_node->segment.size = PAGE_SIZE;
-    new_node->segment.type = HOLE;
-
-    // Insert the new HOLE segment into the free list
-    if (prev_node == NULL) {
-      free_list_head = new_node;
-      new_node->next = curr_node;
-    } else {
-      prev_node->next = new_node;
-      new_node->next = curr_node;
-    }
-  }
+  // Invalid MeMS virtual address
+  // Handle invalid virtual address
 }
+
